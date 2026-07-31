@@ -4,6 +4,8 @@
 # Datasets, generated results, and local experiments
 /data/
 /testdata/
+/experiments/
+/scripts/_archive/
 **/outputs/
 **/output/
 **/runs/

@@ -92,7 +92,7 @@ def calibrate_camera(
         if ret:
             obj_points.append(objp)
             if pattern_type == 'chessboard':
-                corners2 = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), criteria)  # 在原角点的基础上寻找亚像素角点
+                corners2 = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), criteria)  # Refine corners to subpixel accuracy.
                 img_points.append(corners2 if [corners2] else corners)
             else:
                 img_points.append(corners)
@@ -158,4 +158,3 @@ def K_from_intr(
     K[0, 0], K[1, 1] = intr[0], intr[1]
     K[0, 2], K[1, 2] = intr[2], intr[3]
     return K
-

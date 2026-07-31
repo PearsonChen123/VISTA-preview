@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""读 config.json，填默认值、解析路径，输出 shell 变量赋值供 eval。
+"""Load config.json, apply defaults, resolve paths, and emit shell assignments.
 
-所有配置的唯一来源就是 config.json。run_pipeline.sh 只是把它 eval 进来，
-命令行参数仍可覆盖（覆盖发生在 eval 之后）。
+config.json is the single configuration source. run_pipeline.sh evaluates this
+output, after which command-line arguments may still override values.
 
-用法:
+Usage:
     eval "$(python3 lib/load_config.py config.json)"
-    python3 lib/load_config.py config.json --dump     # 人看的格式
+    python3 lib/load_config.py config.json --dump     # Human-readable format
 """
 
 import argparse
@@ -15,16 +15,16 @@ import shlex
 import sys
 from pathlib import Path
 
-# 默认值。config.json 里没写的项走这里，所以 config.json 可以只写要改的部分。
+# Defaults let config.json specify only values that differ.
 DEFAULTS = {
     "project": {
-        "root": None,                      # 必填：场景根目录
-        "work_dir": None,                  # 留空 -> <root>/stereo_depth
+        "root": None,                      # Required scene root
+        "work_dir": None,                  # Empty -> <root>/stereo_depth
     },
     "colmap": {
         "enabled": True,
-        "image_dir": "images",             # 相对 root 或绝对路径
-        "work_dir": None,                  # 留空 -> <root>/colmap
+        "image_dir": "images",             # Relative to root or absolute
+        "work_dir": None,                  # Empty -> <root>/colmap
         "matcher": "exhaustive",           # exhaustive/sequential/spatial/vocab_tree
         "camera_model": "PINHOLE",
         "undistort": True,
@@ -34,28 +34,27 @@ DEFAULTS = {
     },
     "nerfstudio": {
         "method": "nerfacto",
-        "config_path": None,               # 留空 -> 自动找 <root>/outputs 下最新的
+        "config_path": None,               # Empty -> latest under <root>/outputs
         "max_num_iterations": 30000,
-        "output_dir": None,                # 留空 -> <root>/outputs
+        "output_dir": None,                # Empty -> <root>/outputs
         "extra_args": [],
     },
     "stereo": {
-        # shift_mode = "pixels": 用目标视差占图像宽度的百分比来定基线（推荐，直观）
-        #              "baseline": 直接给归一化坐标系下的基线长度（旧行为）
+        # pixels: derive baseline from target disparity as a fraction of image width.
+        # baseline: supply baseline directly in normalized coordinates (legacy).
         "shift_mode": "pixels",
-        "shift_pixels": 0.1,               # 0.1 = 视差达到图像宽度的 10%
-        "reference_depth": None,           # 留空 -> 从 COLMAP 稀疏点云统计
-        "reference_depth_percentile": 25,  # 取深度分布的哪个分位作参考
-                                           # 25 而非中位数：锚近处能把近平面视差压住
-        "shift": 0.2,                      # shift_mode="baseline" 时用
-        # auto_direction: 按相机轨迹自动选平移方向。NeRF 只在相机去过的视角附近
-        # 训练充分，沿轨迹平移留在流形内，垂直于轨迹就是外推、渲染会糊。
+        "shift_pixels": 0.1,               # 0.1 = 10% of image width
+        "reference_depth": None,           # Empty -> estimate from COLMAP sparse points
+        "reference_depth_percentile": 25,  # Reference percentile of depth distribution
+                                           # Near-depth anchoring limits foreground disparity.
+        "shift": 0.2,                      # Used when shift_mode="baseline"
+        # Automatically choose translation along the observed camera trajectory.
         "auto_direction": True,
-        "auto_direction_min_dominance": 0.6,   # 主导性不足则退回 direction
-        "direction": "up",                 # up/down/left/right（auto 关掉或退回时用）
+        "auto_direction_min_dominance": 0.6,   # Fall back to direction below this.
+        "direction": "up",                 # Used when automatic selection is off/falls back.
         "valid_iters": 32,
-        "foundation_dir": None,            # 留空 -> 项目内 third_party/FoundationStereo
-        "foundation_model": None,          # 留空 -> 项目内 models/foundation_stereo/...
+        "foundation_dir": None,            # Empty -> project third_party/FoundationStereo
+        "foundation_model": None,          # Empty -> project models/foundation_stereo/...
     },
     "filter": {
         "enabled": True,
@@ -68,17 +67,17 @@ DEFAULTS = {
         "ncc_window": 4,
         "min_ncc": 0.3,
         "min_texture_std": 0.02,
-        # 额外输出逐像素置信度（票数/源视角数），供深度引导采样按置信度加权
+        # Save per-pixel confidence for confidence-weighted depth-guided sampling.
         "save_confidence": True,
     },
     "slam": {
-        # 把过滤后的深度当可信深度，喂给 DROID-SLAM 跑 RGBD 出位姿。
-        # 深度里被过滤掉的 0 值，DROID 正好当作"无深度先验"，语义吻合。
+        # Feed filtered depth to DROID-SLAM as trusted RGB-D depth. DROID treats
+        # filtered zeroes as "no depth prior", which matches their meaning.
         "enabled": False,
-        "droid_metric_dir": None,          # 留空 -> <nevstereo_root>/droid_metric
-        "use_filtered_depth": True,        # False 则用未过滤的 depth/
+        "droid_metric_dir": None,          # Empty -> <nevstereo_root>/droid_metric
+        "use_filtered_depth": True,        # False uses unfiltered depth/
         "global_ba_frontend": 0,
-        "evaluate": True,                  # 与 transforms.json 的已知位姿对比
+        "evaluate": True,                  # Compare with known transforms.json poses
     },
     "output": {
         "depth_png": True,
@@ -95,7 +94,7 @@ DEFAULTS = {
     },
 }
 
-# JSON 路径 -> shell 变量名
+# JSON path -> shell variable name
 SHELL_VARS = {
     "project.root": "DATA_DIR",
     "project.work_dir": "WORK_DIR",
@@ -153,8 +152,8 @@ def deep_merge(base: dict, override: dict) -> dict:
     out = {k: (v.copy() if isinstance(v, dict) else v) for k, v in base.items()}
     for k, v in (override or {}).items():
         if k not in out:
-            raise SystemExit(f"[load_config] 未知的配置项: {k}"
-                             f"（可选: {', '.join(base)}）")
+            raise SystemExit(f"[load_config] Unknown configuration key: {k}"
+                             f" (choices: {', '.join(base)})")
         if isinstance(out[k], dict) and isinstance(v, dict):
             out[k] = deep_merge(out[k], v)
         else:
@@ -163,11 +162,11 @@ def deep_merge(base: dict, override: dict) -> dict:
 
 
 def resolve(cfg: dict, config_path: Path) -> dict:
-    """把相对路径解析成绝对路径，填好留空的派生项。"""
+    """Resolve relative paths and populate empty derived values."""
     root = cfg["project"]["root"]
     if not root:
-        raise SystemExit("[load_config] config.json 里必须指定 project.root")
-    # 相对路径按 config.json 所在目录解析，这样配置文件可以跟着场景走
+        raise SystemExit("[load_config] project.root is required in config.json")
+    # Resolve relative paths against config.json so the configuration remains portable.
     root = Path(root).expanduser()
     if not root.is_absolute():
         root = (config_path.parent / root).resolve()
@@ -210,17 +209,17 @@ def to_shell(value):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="config.json -> shell 变量")
+    ap = argparse.ArgumentParser(description="config.json -> shell variables")
     ap.add_argument("config", type=Path)
-    ap.add_argument("--dump", action="store_true", help="打印解析后的完整配置")
+    ap.add_argument("--dump", action="store_true", help="Print the complete resolved configuration")
     args = ap.parse_args()
 
     if not args.config.is_file():
-        raise SystemExit(f"[load_config] 找不到配置文件: {args.config}")
+        raise SystemExit(f"[load_config] Configuration file not found: {args.config}")
     try:
         user = json.loads(args.config.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
-        raise SystemExit(f"[load_config] {args.config} 不是合法 JSON: {e}")
+        raise SystemExit(f"[load_config] {args.config} is not valid JSON: {e}")
 
     cfg = resolve(deep_merge(DEFAULTS, user), args.config.resolve())
 
@@ -231,10 +230,10 @@ def main():
 
     for dotted, var in SHELL_VARS.items():
         print(f"{var}={shlex.quote(to_shell(get(cfg, dotted)))}")
-    # 数组单独处理
+    # Handle arrays separately.
     extra = cfg["nerfstudio"]["extra_args"]
     print(f"NS_EXTRA_ARGS={shlex.quote(' '.join(str(a) for a in extra))}")
-    # 解释器路径由 conda_root + 环境名拼出来
+    # Construct interpreter paths from conda_root and environment names.
     cr, ne, se = (cfg["env"]["conda_root"], cfg["env"]["nerfstudio_env"],
                   cfg["env"]["stereo_env"])
     print(f"NERF_PY={shlex.quote(f'{cr}/envs/{ne}/bin/python')}")

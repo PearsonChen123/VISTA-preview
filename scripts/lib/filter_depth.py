@@ -1,41 +1,28 @@
 #!/usr/bin/env python3
-"""多视图几何一致性过滤，思路照搬 COLMAP PatchMatch Stereo 的 filter 阶段。
+"""Multi-view geometric consistency filtering based on COLMAP PatchMatch Stereo.
 
-**做什么**
+FoundationStereo produces dense depth for every pixel regardless of reliability.
+This module cross-validates depth using camera poses. A correct depth should
+return to the original pixel after projection into another view and back.
 
-FoundationStereo 对每个像素都给稠密深度，不管那个像素是不是真的可信。
-这里用相机位姿做多视图交叉验证：一个像素的深度如果是对的，那么把它投到
-别的视角、再投回来，应该能回到原处。回不来的就是错的。
+Four checks are applied for every reference pixel and source view:
 
-对每个参考视角的每个像素，逐个源视角检查四项：
+1. **Round-trip reprojection error**: unproject to 3D, project into the source,
+   sample source depth, unproject again, and project back to the reference.
+2. **Relative depth error** between projected and sampled source depth.
+3. **Triangulation angle**: views with insufficient angular separation abstain.
+4. **NCC**: warp the source image using current depth and compute windowed NCC.
+   This catches low-texture regions whose guessed depth happens to be
+   geometrically self-consistent. It is enabled with --image-dir.
 
-1. **前后向重投影误差**（几何）按深度反投到 3D，投进源视角取该处深度，
-   再用源视角的深度反投回 3D、投回参考视角。偏移超过阈值就不算一致。
-2. **相对深度误差**（几何）正向投影算出的深度 与 源视角深度图里读到的深度，
-   两者相对差超过阈值就不算一致。
-3. **三角化角**（几何）两个相机对该 3D 点的张角太小时深度本来就不可解，
-   直接不让它参与投票。
-4. **NCC**（光度）把源图按当前深度 warp 回参考视角，做滑动窗口 NCC。
-   前三项都是纯几何的，管不住"纹理很差、深度靠猜但恰好几何自洽"的区域；
-   这一项补上。需要 --image-dir 才启用。
+Source views passing all checks cast votes; pixels below the vote threshold are
+untrusted. Unlike COLMAP, which obtains NCC confidence during PatchMatch, this
+implementation computes NCC independently and adds relative-depth checking.
+Untrusted pixels are set to zero, and a vote map is also produced as soft confidence.
 
-通过的源视角计入票数，票数少于阈值的像素判为不可信。
-
-**和 COLMAP 的区别**
-
-COLMAP 的 filter 也是三项（光度 NCC + 几何一致性 + 三角化角），但它的 NCC
-来自 PatchMatch 匹配过程中算出的选择概率。这里 FoundationStereo 不输出置信度，
-所以 NCC 是自己重新算的，并且额外加了一项"相对深度误差"。
-
-COLMAP 是把不可信像素直接置 0（宁可给洞也不给错）。这里默认也置 0，
-但同时输出一张票数图，需要软置信度的话可以直接用。
-
-**为什么这一步能轻松打满 GPU**
-
-PatchMatch 的深度估计有传播依赖（第 r 行要等第 r-1 行），COLMAP 因此只能
-每列开一个线程串行扫，占用率不到 1%。而过滤没有这个依赖——每个
-(像素, 源视角) 对都是独立的，可以整块张量一次算完。
-一张 480x640 配 8 个源视角就是 246 万个并行单元。
+Filtering has no propagation dependency between pixels or views, so an entire
+tensor can be evaluated in parallel. A 480x640 image with eight source views
+provides about 2.46 million parallel units.
 """
 
 import argparse
@@ -46,12 +33,12 @@ import numpy as np
 import torch
 
 
-# ---------------------------------------------------------------- 数据加载 ----
+# ---------------------------------------------------------------- Data loading ----
 def load_scene(transforms_json: Path, depth_dir: Path, device):
-    """读 transforms.json 和深度图，返回位姿、内参、深度张量。
+    """Load transforms.json and depth maps; return poses, intrinsics, and depth.
 
-    transforms.json 用的是 OpenGL/Blender 约定（x 右, y 上, z 后，相机看向 -z）。
-    深度图存的是沿光轴的 z 深度（FoundationStereo 的 fx*baseline/disp）。
+    transforms.json uses the OpenGL/Blender convention (x-right, y-up, z-back,
+    camera facing -z). Depth maps store z-depth along the optical axis.
     """
     data = json.loads(transforms_json.read_text(encoding="utf-8"))
     frames = data["frames"]
@@ -64,7 +51,7 @@ def load_scene(transforms_json: Path, depth_dir: Path, device):
     missing = []
     for frame in frames:
         stem = Path(frame["file_path"]).stem
-        # 深度图可能按顺序命名（00000.npy），也可能与 file_path 同名
+        # Depth maps may be sequentially named or share the file_path stem.
         cand = depth_dir / f"{stem}.npy"
         if not cand.exists() and frame.get("depth_file_path"):
             cand = (transforms_json.parent / frame["depth_file_path"]).with_suffix(".npy")
@@ -78,13 +65,13 @@ def load_scene(transforms_json: Path, depth_dir: Path, device):
 
     if not depths:
         raise FileNotFoundError(
-            f"{depth_dir} 里没有能和 {transforms_json} 对上的深度图")
+            f"No depth maps in {depth_dir} match {transforms_json}")
     if missing:
-        print(f"[filter_depth] 警告: {len(missing)} 个 frame 没有对应深度图，已跳过")
+        print(f"[filter_depth] Warning: skipped {len(missing)} frames without depth maps")
 
     shapes = {d.shape for d in depths}
     if len(shapes) != 1:
-        raise ValueError(f"深度图尺寸不一致: {shapes}")
+        raise ValueError(f"Inconsistent depth-map dimensions: {shapes}")
 
     c2w = torch.tensor(np.stack(poses), dtype=torch.float32, device=device)   # (N,4,4)
     if c2w.shape[-2:] == (3, 4):
@@ -96,10 +83,10 @@ def load_scene(transforms_json: Path, depth_dir: Path, device):
 
 
 def load_images(image_dir: Path, names, shape, device):
-    """按深度图的名字读对应的渲染图，转灰度。返回 (N,H,W) 或 None。
+    """Load rendered images by depth-map name and convert them to grayscale.
 
-    NCC 检验要用渲染出来的图，所以名字必须和深度图对得上——
-    两者都来自同一次 ns-render，命名是一致的。
+    NCC requires rendered images whose names match the depth maps. Both are
+    produced by the same ns-render invocation and therefore share names.
     """
     import cv2
     H, W = shape
@@ -120,22 +107,22 @@ def load_images(image_dir: Path, names, shape, device):
             missing.append(name)
             g = np.zeros((H, W), np.uint8)
         if g.shape != (H, W):
-            raise ValueError(f"{hit} 尺寸 {g.shape} 与深度图 {(H, W)} 不符")
+            raise ValueError(f"{hit} dimensions {g.shape} do not match depth map {(H, W)}")
         imgs.append(g.astype(np.float32) / 255.0)
 
     if len(missing) == len(names):
         raise FileNotFoundError(
-            f"{image_dir} 里一张都对不上深度图的名字（例如 {names[0]}.png）")
+            f"No image in {image_dir} matches a depth-map name such as {names[0]}.png")
     if missing:
-        print(f"[filter_depth] 警告: {len(missing)} 张渲染图缺失，这些视角不参与 NCC")
+        print(f"[filter_depth] Warning: {len(missing)} rendered images are missing; excluded from NCC")
     return torch.tensor(np.stack(imgs), dtype=torch.float32, device=device)
 
 
-# ------------------------------------------------------------ 投影/反投影 ----
+# ------------------------------------------------------ Projection/unprojection ----
 def unproject(depth, K, c2w):
-    """像素 + z 深度 -> 世界坐标。depth (B,H,W) -> (B,H,W,3)。"""
+    """Convert pixels plus z-depth to world coordinates."""
     B, H, W = depth.shape
-    fx, fy, cx, cy = K.unbind(-1)                                   # 各 (B,)
+    fx, fy, cx, cy = K.unbind(-1)                                   # Each is (B,)
     v, u = torch.meshgrid(
         torch.arange(H, device=depth.device, dtype=torch.float32),
         torch.arange(W, device=depth.device, dtype=torch.float32),
@@ -144,7 +131,7 @@ def unproject(depth, K, c2w):
     v = v.expand(B, H, W)
     s = lambda t: t.view(B, 1, 1)                                   # noqa: E731
 
-    # OpenGL 相机系：x 右, y 上, 看向 -z
+    # OpenGL camera coordinates: x-right, y-up, facing -z.
     x = (u - s(cx)) / s(fx) * depth
     y = -(v - s(cy)) / s(fy) * depth
     z = -depth
@@ -156,7 +143,7 @@ def unproject(depth, K, c2w):
 
 
 def project(points_world, K, c2w):
-    """世界坐标 -> 像素 + z 深度。points (B,H,W,3) -> uv (B,H,W,2), depth (B,H,W)。"""
+    """Convert world coordinates to pixels plus z-depth."""
     B = points_world.shape[0]
     R = c2w[:, :3, :3].view(B, 1, 1, 3, 3)
     t = c2w[:, :3, 3].view(B, 1, 1, 3)
@@ -165,7 +152,7 @@ def project(points_world, K, c2w):
     fx, fy, cx, cy = K.unbind(-1)
     s = lambda x: x.view(B, 1, 1)                                   # noqa: E731
 
-    depth = -pts_cam[..., 2]                                        # 看向 -z
+    depth = -pts_cam[..., 2]                                        # Camera faces -z.
     safe = depth.clamp(min=1e-6)
     u = s(fx) * pts_cam[..., 0] / safe + s(cx)
     v = -s(fy) * pts_cam[..., 1] / safe + s(cy)
@@ -173,17 +160,18 @@ def project(points_world, K, c2w):
 
 
 def _uv_to_grid(uv, H, W):
-    """像素坐标 -> grid_sample 的归一化坐标（align_corners=True）。"""
+    """Convert pixel coordinates to normalized grid_sample coordinates."""
     gx = 2.0 * uv[..., 0] / max(W - 1, 1) - 1.0
     gy = 2.0 * uv[..., 1] / max(H - 1, 1) - 1.0
     return torch.stack([gx, gy], dim=-1)
 
 
 def sample_depth(depth_maps, uv):
-    """在深度图上按像素坐标双线性采样。depth (B,H,W), uv (B,H,W,2) -> (B,H,W)。
+    """Bilinearly sample depth maps at pixel coordinates.
 
-    用最近邻会在深度不连续处引入伪一致，但双线性会跨边界插值出中间值。
-    这里用双线性 + 后面的相对深度检查来兜底。
+    Nearest-neighbor sampling creates false consistency at depth discontinuities,
+    while bilinear sampling interpolates across boundaries. The subsequent
+    relative-depth check guards against the latter.
     """
     B, H, W = depth_maps.shape
     out = torch.nn.functional.grid_sample(
@@ -193,7 +181,7 @@ def sample_depth(depth_maps, uv):
 
 
 def sample_image(images, uv):
-    """在灰度图上按像素坐标双线性采样。images (B,H,W), uv (B,H,W,2) -> (B,H,W)。"""
+    """Bilinearly sample grayscale images at pixel coordinates."""
     B, H, W = images.shape
     out = torch.nn.functional.grid_sample(
         images.unsqueeze(1), _uv_to_grid(uv, H, W), mode="bilinear",
@@ -202,7 +190,7 @@ def sample_image(images, uv):
 
 
 def _box(x, radius):
-    """半径 radius 的滑动窗口均值。边界处按实际有效像素数归一化。"""
+    """Sliding-window mean with the given radius, normalized at boundaries."""
     k = 2 * radius + 1
     return torch.nn.functional.avg_pool2d(
         x.unsqueeze(1), kernel_size=k, stride=1, padding=radius,
@@ -210,22 +198,21 @@ def _box(x, radius):
 
 
 def compute_ncc(ref, warped, valid, radius, min_texture_std=0.0, eps=1e-6):
-    """参考图与 warp 过来的源图之间的滑动窗口 NCC。
+    """Windowed NCC between a reference image and a warped source image.
 
-    ref/warped/valid 形状 (B,H,W)，返回 (B,H,W) 的 NCC，取值 [-1,1]。
+    Inputs and output have shape (B,H,W); NCC values are in [-1,1].
 
-    实现上不逐窗口循环——NCC 的每一项都是窗口内的一阶/二阶矩，
-    全部用盒式滤波（avg_pool2d, stride=1）一次算出：
+    First- and second-order window moments are computed with box filters:
 
         NCC = (E[rw] - E[r]E[w]) / sqrt(Var[r] * Var[w])
 
-    warp 用的是每个像素**自己的深度**，不是拟合一个平面，所以不需要法向；
-    斜面只要深度图局部准确就能对上。深度不连续处窗口会混进前后景，
-    NCC 自然掉下来——那恰好就是不该信的地方。
+    The warp uses each pixel's own depth rather than a fitted plane, so no normals
+    are required. Windows spanning depth discontinuities mix foreground and
+    background, naturally lowering NCC in precisely the unreliable regions.
     """
     r = ref * valid
     w = warped * valid
-    n = _box(valid.float(), radius).clamp(min=eps)      # 窗口内有效像素占比
+    n = _box(valid.float(), radius).clamp(min=eps)      # Valid-pixel ratio in the window
 
     mu_r = _box(r, radius) / n
     mu_w = _box(w, radius) / n
@@ -236,35 +223,35 @@ def compute_ncc(ref, warped, valid, radius, min_texture_std=0.0, eps=1e-6):
     ncc = cov / torch.sqrt(var_r * var_w + eps)
     ncc = ncc.clamp(-1, 1)
 
-    # 参考窗口没纹理时 NCC 的分母趋零，结果被噪声主导，此时它**不该表态**：
-    # 没纹理不代表深度错。所以这里返回 NaN 表示弃权，由调用方当作"通过"处理，
-    # 而不是判成 -1 去否决——那会把大片平坦区域无差别砍掉。
+    # In textureless windows the denominator approaches zero and noise dominates.
+    # Texturelessness does not imply bad depth, so NaN means abstain and callers
+    # treat it as passing rather than rejecting large uniform areas.
     abstain = (n < 0.5) | (torch.sqrt(var_r) < min_texture_std) | (var_r < eps)
     return torch.where(abstain, torch.full_like(ncc, float("nan")), ncc)
 
 
-# ---------------------------------------------------------------- 选源视角 ----
+# ---------------------------------------------------------- Source-view selection ----
 def select_sources(c2w, num_src):
-    """给每个参考视角挑 num_src 个源视角。
+    """Select num_src source views for every reference view.
 
-    按相机中心距离取最近的若干个——太近则基线不足（三角化角小），
-    太远则视野重叠少。距离排序是个简单有效的折中，实际是否可用还有
-    三角化角那一关兜底。
+    Choose nearest camera centers. Views that are too close have inadequate
+    baseline, while distant views have little overlap. Distance is a practical
+    compromise, with triangulation-angle checking as a final guard.
     """
     centers = c2w[:, :3, 3]                                          # (N,3)
     dist = torch.cdist(centers, centers)                             # (N,N)
-    dist.fill_diagonal_(float("inf"))                                # 排除自己
+    dist.fill_diagonal_(float("inf"))                                # Exclude self.
     k = min(num_src, len(c2w) - 1)
     return dist.topk(k, largest=False).indices                       # (N,k)
 
 
-# ---------------------------------------------------------------- 核心过滤 ----
+# ---------------------------------------------------------------- Core filter ----
 @torch.no_grad()
 def filter_depths(c2w, K, D, src_idx, args, images=None, diag=None):
-    """返回 (过滤后的深度, 每像素一致票数)。
+    """Return filtered depth and per-pixel consistency votes.
 
-    对每个参考视角，把它的全部源视角打包成一个 batch 一次算完——
-    没有任何跨像素依赖，纯张量运算。
+    All source views for a reference view are evaluated in one batch using only
+    tensor operations and no cross-pixel dependencies.
     """
     N, H, W = D.shape
     out_depth = torch.zeros_like(D)
@@ -277,25 +264,25 @@ def filter_depths(c2w, K, D, src_idx, args, images=None, diag=None):
         d_ref = D[i:i + 1]                                           # (1,H,W)
         valid_ref = torch.isfinite(d_ref) & (d_ref > 0)
 
-        # 参考像素 -> 世界（一次，随后广播到 k 个源视角）
+        # Reference pixels -> world coordinates, then broadcast to k source views.
         pts_w = unproject(d_ref.nan_to_num(), K[i:i + 1], c2w[i:i + 1])
         pts_w_k = pts_w.expand(k, H, W, 3)
 
-        # 正向：投进各源视角
+        # Forward projection into each source view.
         uv_src, d_proj = project(pts_w_k, K[js], c2w[js])
         in_bounds = ((uv_src[..., 0] >= 0) & (uv_src[..., 0] <= W - 1) &
                      (uv_src[..., 1] >= 0) & (uv_src[..., 1] <= H - 1) &
                      (d_proj > 0))
 
-        # 源视角深度图上采样
+        # Sample the source-view depth maps.
         d_src = sample_depth(D[js], uv_src)
         has_src = torch.isfinite(d_src) & (d_src > 0)
 
-        # 判据 2：相对深度误差
+        # Criterion 2: relative depth error.
         depth_err = (d_proj - d_src).abs() / d_src.clamp(min=1e-6)
 
-        # 反向：在 uv_src 处（非整数像素）按源视角深度反投，再投回参考视角。
-        # 注意这里必须用 uv_src 构造射线，而不是源视角的整数像素网格。
+        # Reverse: unproject source depth at noninteger uv_src, then project back.
+        # Rays must use uv_src rather than the source view's integer pixel grid.
         pts_back = _unproject_at(uv_src, d_src.nan_to_num(), K[js], c2w[js])
         uv_back, _ = project(pts_back, K[i:i + 1].expand(k, 4), c2w[i:i + 1].expand(k, 4, 4))
 
@@ -306,7 +293,7 @@ def filter_depths(c2w, K, D, src_idx, args, images=None, diag=None):
         uv_ref = torch.stack([u, v], dim=-1).expand(k, H, W, 2)
         reproj_err = (uv_back - uv_ref).norm(dim=-1)
 
-        # 判据 3：三角化角（参考相机中心、源相机中心 对 3D 点的张角）
+        # Criterion 3: angle subtended by reference/source centers at the 3D point.
         c_ref = c2w[i, :3, 3].view(1, 1, 1, 3)
         c_src = c2w[js, :3, 3].view(k, 1, 1, 3)
         r1 = torch.nn.functional.normalize(c_ref - pts_w_k, dim=-1)
@@ -316,16 +303,16 @@ def filter_depths(c2w, K, D, src_idx, args, images=None, diag=None):
         ok_bounds = in_bounds & has_src
         ok_reproj = reproj_err < args.max_reproj_error
         ok_depth = depth_err < args.max_depth_error
-        ok_tri = cos_tri < cos_min_tri                               # 角越大 cos 越小
+        ok_tri = cos_tri < cos_min_tri                               # Larger angles have smaller cosine.
 
-        # 判据 4：光度一致性（NCC）。把源图按当前深度 warp 回参考视角，
-        # 与参考图做滑动窗口 NCC。纯几何的三项管不住"纹理很差、深度靠猜
-        # 但恰好几何自洽"的区域（大片白墙那种），这一项就是补这个。
+        # Criterion 4: photometric consistency (NCC). Warp source images into
+        # the reference view and compare windows. This catches low-texture areas
+        # whose guessed depths happen to be geometrically self-consistent.
         if images is not None:
             warped = sample_image(images[js], uv_src)                # (k,H,W)
             ncc = compute_ncc(images[i:i + 1].expand(k, H, W), warped, ok_bounds,
                               args.ncc_window, args.min_texture_std)
-            # NaN = 弃权（窗口没纹理），当作通过；只有真正算得出且偏低才否决
+            # NaN means abstain for textureless windows; only a valid low NCC rejects.
             ok_ncc = torch.nan_to_num(ncc, nan=1.0) >= args.min_ncc
             if diag is not None:
                 diag["_ncc_abstain"] += torch.isnan(ncc).sum().item()
@@ -345,23 +332,22 @@ def filter_depths(c2w, K, D, src_idx, args, images=None, diag=None):
         out_votes[i] = votes
         out_depth[i] = torch.where(keep, d_ref.squeeze(0), torch.zeros(()).to(D))
 
-        # 诊断：统计每一项各自否掉了多少 (像素,源视角) 对。
-        # 调参时最想知道的就是"到底是哪一关卡得太死"。
+        # Count how many pixel/source-view pairs each criterion rejects.
         if diag is not None:
             n = ok_bounds.numel()
-            diag["总对数"] += n
-            diag["出界/源无深度"] += (~ok_bounds).sum().item()
-            diag["重投影误差超限"] += (ok_bounds & ~ok_reproj).sum().item()
-            diag["相对深度误差超限"] += (ok_bounds & ok_reproj & ~ok_depth).sum().item()
-            diag["三角化角过小"] += (ok_bounds & ok_reproj & ok_depth & ~ok_tri).sum().item()
-            diag["NCC 过低"] += (ok_bounds & ok_reproj & ok_depth & ok_tri & ~ok_ncc).sum().item()
-            diag["通过"] += consistent.sum().item()
+            diag["total_pairs"] += n
+            diag["out_of_bounds_or_no_source_depth"] += (~ok_bounds).sum().item()
+            diag["reprojection_error"] += (ok_bounds & ~ok_reproj).sum().item()
+            diag["relative_depth_error"] += (ok_bounds & ok_reproj & ~ok_depth).sum().item()
+            diag["small_triangulation_angle"] += (ok_bounds & ok_reproj & ok_depth & ~ok_tri).sum().item()
+            diag["low_ncc"] += (ok_bounds & ok_reproj & ok_depth & ok_tri & ~ok_ncc).sum().item()
+            diag["passed"] += consistent.sum().item()
 
     return out_depth, out_votes
 
 
 def _unproject_at(uv, depth, K, c2w):
-    """在给定的（非整数）像素坐标处按深度反投到世界。uv (B,H,W,2)。"""
+    """Unproject depth at given noninteger pixel coordinates into world space."""
     B = uv.shape[0]
     fx, fy, cx, cy = K.unbind(-1)
     s = lambda t: t.view(B, 1, 1)                                    # noqa: E731
@@ -374,9 +360,9 @@ def _unproject_at(uv, depth, K, c2w):
     return (R @ pts_cam.unsqueeze(-1)).squeeze(-1) + t
 
 
-# ---------------------------------------------------------------- 可视化 ----
+# --------------------------------------------------------------- Visualization ----
 def save_visualization(vis_dir, name, depth_before, depth_after, votes, num_src):
-    """三联图：过滤前深度 / 一致票数 / 过滤后深度。"""
+    """Three-panel view: original depth / consistency votes / filtered depth."""
     import cv2
     vis_dir.mkdir(parents=True, exist_ok=True)
 
@@ -407,34 +393,34 @@ def save_visualization(vis_dir, name, depth_before, depth_after, votes, num_src)
 # ---------------------------------------------------------------------- CLI ----
 def main():
     ap = argparse.ArgumentParser(
-        description="多视图几何一致性过滤（COLMAP PatchMatch filter 的 GPU 张量版）")
+        description="GPU tensor implementation of COLMAP-style multi-view consistency filtering")
     ap.add_argument("--transforms-json", required=True, type=Path)
     ap.add_argument("--depth-dir", required=True, type=Path)
     ap.add_argument("--output-dir", required=True, type=Path)
     ap.add_argument("--num-src", type=int, default=8,
-                    help="每个参考视角用几个源视角交叉验证（默认 8）")
+                    help="Number of source views per reference view (default: 8)")
     ap.add_argument("--max-reproj-error", type=float, default=2.0,
-                    help="前后向重投影误差上限，像素（COLMAP 默认 1.0）")
+                    help="Maximum round-trip reprojection error in pixels (COLMAP default: 1.0)")
     ap.add_argument("--max-depth-error", type=float, default=0.01,
-                    help="相对深度误差上限（默认 1%%）")
+                    help="Maximum relative depth error (default: 1%%)")
     ap.add_argument("--min-triangulation-angle", type=float, default=3.0,
-                    help="最小三角化角，度（COLMAP 默认 3）")
+                    help="Minimum triangulation angle in degrees (COLMAP default: 3)")
     ap.add_argument("--min-num-consistent", type=int, default=2,
-                    help="至少几个源视角一致才保留（COLMAP 默认 2）")
+                    help="Minimum consistent source views required (COLMAP default: 2)")
     ap.add_argument("--image-dir", type=Path, default=None,
-                    help="渲染图目录（通常是 render/left）。给了才做 NCC 光度检验")
+                    help="Rendered-image directory, usually render/left; enables NCC")
     ap.add_argument("--ncc-window", type=int, default=4,
-                    help="NCC 滑动窗口半径，实际窗口 (2r+1)^2（默认 4 -> 9x9）")
+                    help="NCC window radius; actual size is (2r+1)^2 (default: 4 -> 9x9)")
     ap.add_argument("--min-ncc", type=float, default=0.3,
-                    help="NCC 下限，取值 [-1,1]（默认 0.3）")
+                    help="Minimum NCC in [-1,1] (default: 0.3)")
     ap.add_argument("--min-texture-std", type=float, default=0.02,
-                    help="参考窗口局部标准差低于此值时 NCC 弃权而非否决（默认 0.02）")
+                    help="NCC abstains below this reference-window standard deviation (default: 0.02)")
     ap.add_argument("--save-confidence", action="store_true",
-                    help="额外输出逐像素置信度（票数/源视角数）到 <output>/confidence/")
+                    help="Save per-pixel confidence (votes/source views) under <output>/confidence/")
     ap.add_argument("--vis-dir", type=Path, default=None,
-                    help="给了就输出可视化三联图；不给就不生成")
+                    help="Optional directory for three-panel visualizations")
     ap.add_argument("--no-diagnose", action="store_true",
-                    help="不打印逐判据的拒绝统计")
+                    help="Do not print rejection statistics by criterion")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
@@ -442,16 +428,16 @@ def main():
     c2w, K, D, names = load_scene(args.transforms_json, args.depth_dir, device)
     N, H, W = D.shape
     k = min(args.num_src, N - 1)
-    print(f"[filter_depth] {N} 个视角 {W}x{H}，每个配 {k} 个源视角")
-    print(f"[filter_depth] 并行单元 = {H*W*k:,} (像素 x 源视角)，逐参考视角批处理")
+    print(f"[filter_depth] {N} views at {W}x{H}, with {k} source views each")
+    print(f"[filter_depth] Parallel units = {H*W*k:,} (pixels x source views), batched by reference")
 
     images = None
     if args.image_dir:
         images = load_images(args.image_dir, names, (H, W), device)
-        print(f"[filter_depth] NCC 已启用: 窗口 {2*args.ncc_window+1}x{2*args.ncc_window+1}, "
-              f"阈值 {args.min_ncc}")
+        print(f"[filter_depth] NCC enabled: window {2*args.ncc_window+1}x{2*args.ncc_window+1}, "
+              f"threshold {args.min_ncc}")
     else:
-        print("[filter_depth] 未给 --image-dir，跳过 NCC 光度检验（只做几何三项）")
+        print("[filter_depth] No --image-dir; skipping NCC and using geometry only")
 
     src_idx = select_sources(c2w, args.num_src)
     if device.type == "cuda":
@@ -459,8 +445,8 @@ def main():
     import time
     t0 = time.time()
     diag = None if args.no_diagnose else dict.fromkeys(
-        ["总对数", "出界/源无深度", "重投影误差超限", "相对深度误差超限",
-         "三角化角过小", "NCC 过低", "通过",
+        ["total_pairs", "out_of_bounds_or_no_source_depth", "reprojection_error",
+         "relative_depth_error", "small_triangulation_angle", "low_ncc", "passed",
          "_ncc_abstain", "_ncc_sum", "_ncc_n"], 0)
     filtered, votes = filter_depths(c2w, K, D, src_idx, args, images, diag)
     if device.type == "cuda":
@@ -480,32 +466,31 @@ def main():
     for i, name in enumerate(names):
         np.save(args.output_dir / f"{name}.npy", F_cpu[i])
         if args.save_confidence:
-            # 票数 / 源视角数 -> [0,1] 的逐像素置信度。
-            # 比二值的"信/不信"多保留了信息：下游可以按置信度加权，
-            # 而不是在覆盖率和精度之间二选一。放子目录是为了不被
-            # sorted(glob("*.npy")) 这类调用误读成深度图。
+            # Votes/source-view count gives [0,1] confidence. This preserves more
+            # information than a binary mask for downstream weighting. A subdirectory
+            # prevents sorted(glob("*.npy")) calls from treating it as depth.
             np.save(conf_dir / f"{name}.npy", (V_cpu[i] / max(k, 1)).astype(np.float32))
         if args.vis_dir:
             save_visualization(args.vis_dir, name, D_cpu[i], F_cpu[i], V_cpu[i], k)
 
-    print(f"[filter_depth] 耗时 {dt:.2f}s ({dt/N*1000:.1f} ms/视角)")
-    print(f"[filter_depth] 保留 {kept:,}/{total:,} 像素 ({kept/max(total,1)*100:.1f}%)")
-    print(f"[filter_depth] 平均票数 {V_cpu.mean():.2f}/{k}")
+    print(f"[filter_depth] Elapsed {dt:.2f}s ({dt/N*1000:.1f} ms/view)")
+    print(f"[filter_depth] Kept {kept:,}/{total:,} pixels ({kept/max(total,1)*100:.1f}%)")
+    print(f"[filter_depth] Mean votes {V_cpu.mean():.2f}/{k}")
     if diag:
-        tot = max(diag["总对数"], 1)
-        print("[filter_depth] 逐判据拒绝统计 (按 像素x源视角 对计):")
-        for k in ["出界/源无深度", "重投影误差超限", "相对深度误差超限",
-                  "三角化角过小", "NCC 过低", "通过"]:
+        tot = max(diag["total_pairs"], 1)
+        print("[filter_depth] Rejections by criterion (pixel x source-view pairs):")
+        for k in ["out_of_bounds_or_no_source_depth", "reprojection_error",
+                  "relative_depth_error", "small_triangulation_angle", "low_ncc", "passed"]:
             print(f"    {k:<18} {diag[k]:>12,}  {diag[k]/tot*100:5.1f}%")
         if diag["_ncc_n"] or diag["_ncc_abstain"]:
             ab = diag["_ncc_abstain"]
-            print(f"    {'(NCC 弃权/无纹理)':<18} {ab:>12,}  {ab/tot*100:5.1f}%"
-                  f"   有效 NCC 均值 {diag['_ncc_sum']/max(diag['_ncc_n'],1):.3f}")
-    print(f"[filter_depth] 输出 -> {args.output_dir}")
+            print(f"    {'(NCC abstained/no texture)':<18} {ab:>12,}  {ab/tot*100:5.1f}%"
+                  f"   mean valid NCC {diag['_ncc_sum']/max(diag['_ncc_n'],1):.3f}")
+    print(f"[filter_depth] Output -> {args.output_dir}")
     if args.save_confidence:
-        print(f"[filter_depth] 置信度 -> {args.output_dir/'confidence'}")
+        print(f"[filter_depth] Confidence -> {args.output_dir/'confidence'}")
     if args.vis_dir:
-        print(f"[filter_depth] 可视化 -> {args.vis_dir}")
+        print(f"[filter_depth] Visualizations -> {args.vis_dir}")
 
 
 if __name__ == "__main__":

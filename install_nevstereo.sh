@@ -1,48 +1,48 @@
 #!/usr/bin/env bash
 #==============================================================================
-#  Nevstereo 安装脚本 —— RTX 5090 / Blackwell (sm_120) 适配
+#  Nevstereo installer - RTX 5090 / Blackwell (sm_120) support
 #==============================================================================
 #
-#  两个 conda 环境，各管一摊：
+#  Two conda environments with separate responsibilities:
 #
-#    nerfstudio_sm120  →  nerfstudio (nerfacto / splatfacto)   [已存在，本脚本只校验，不修改]
-#    nevstereo         →  droid_metric (DROID-SLAM + Metric3D) [本脚本创建]
+#    nerfstudio_sm120  -> nerfstudio (nerfacto / splatfacto)   [existing; only validated]
+#    nevstereo         -> droid_metric (DROID-SLAM + Metric3D) [created by this script]
 #
-#  典型流程：
-#    conda activate nevstereo        # 1. 跑 droid_metric 出位姿/深度/mesh
-#    conda activate nerfstudio_sm120 # 2. 跑 nerfstudio 训练辐射场
+#  Typical workflow:
+#    conda activate nevstereo        # 1. Run droid_metric to generate poses, depth, and a mesh
+#    conda activate nerfstudio_sm120 # 2. Run nerfstudio to train a radiance field
 #
-#  用法：
-#    bash install_nevstereo.sh            # 全流程
-#    bash install_nevstereo.sh check      # 只做环境预检
-#    bash install_nevstereo.sh repo       # 只克隆/更新 droid_metric
-#    bash install_nevstereo.sh patch      # 只打 sm_120 补丁
-#    bash install_nevstereo.sh env        # 只建 conda 环境 + 装 Python 依赖
-#    bash install_nevstereo.sh build      # 只编译 CUDA 扩展 (droid_backends / lietorch)
-#    bash install_nevstereo.sh models     # 只下载预训练权重 (~7GB)
-#    bash install_nevstereo.sh verify     # 只做安装后验证
+#  Usage:
+#    bash install_nevstereo.sh            # Run the complete workflow
+#    bash install_nevstereo.sh check      # Run environment checks only
+#    bash install_nevstereo.sh repo       # Clone/update droid_metric only
+#    bash install_nevstereo.sh patch      # Apply sm_120 patches only
+#    bash install_nevstereo.sh env        # Create the conda environment and install Python dependencies
+#    bash install_nevstereo.sh build      # Build CUDA extensions (droid_backends / lietorch)
+#    bash install_nevstereo.sh models     # Download pretrained weights (~7 GB)
+#    bash install_nevstereo.sh verify     # Run post-installation validation only
 #
-#  脚本幂等：重复执行安全，已完成的步骤会跳过。
+#  This script is idempotent: completed stages are skipped on subsequent runs.
 #==============================================================================
 
 set -euo pipefail
 
 #------------------------------------------------------------------------------
-# 配置
+# Configuration
 #------------------------------------------------------------------------------
-ROOT="/mnt/g/algorithm_backup/Nevstereo"        # 所有代码/权重/输出都在这里
+ROOT="/mnt/g/algorithm_backup/Nevstereo"        # All code, weights, and outputs live here.
 REPO="${ROOT}/droid_metric"
 CONDA_ROOT="/home/pengcc/miniconda3"
 
-ENV_DROID="nevstereo"                            # droid_metric 环境
-ENV_NERF="nerfstudio_sm120"                      # nerfstudio 环境（不动）
+ENV_DROID="nevstereo"                            # droid_metric environment
+ENV_NERF="nerfstudio_sm120"                      # Existing nerfstudio environment; do not modify.
 
 PY_VER="3.11"
 TORCH_VER="2.8.0"
 TV_VER="0.23.0"
 CU_TAG="cu128"
 
-# 关键：/usr/local/cuda 在本机指向 11.8，必须显式用 12.8（Blackwell 最低要求）
+# Important: /usr/local/cuda points to 11.8 on this host; explicitly use 12.8 for Blackwell.
 export CUDA_HOME="/usr/local/cuda-12.8"
 export PATH="${CUDA_HOME}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
@@ -50,14 +50,14 @@ export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
 # 5090 = compute capability 12.0
 export TORCH_CUDA_ARCH_LIST="12.0"
 
-# nvcc 编译 CUDA 模板极吃内存，本机 30GB；MAX_JOBS 太大会被 OOM killer 杀掉
-# （表现为 ninja 报 "Killed" 而不是编译错误）
+# nvcc CUDA template compilation is memory-intensive. This host has 30 GB of RAM;
+# excessive MAX_JOBS triggers the OOM killer, and ninja reports "Killed".
 export MAX_JOBS="${MAX_JOBS:-4}"
 
 PY="${CONDA_ROOT}/envs/${ENV_DROID}/bin/python"
 
 #------------------------------------------------------------------------------
-# 小工具
+# Helpers
 #------------------------------------------------------------------------------
 c_info()  { printf '\033[1;34m[*]\033[0m %s\n' "$*"; }
 c_ok()    { printf '\033[1;32m[✓]\033[0m %s\n' "$*"; }
@@ -66,82 +66,82 @@ c_err()   { printf '\033[1;31m[✗]\033[0m %s\n' "$*" >&2; }
 c_step()  { printf '\n\033[1;36m===== %s =====\033[0m\n' "$*"; }
 
 #------------------------------------------------------------------------------
-# 1. 预检
+# 1. Prerequisite checks
 #------------------------------------------------------------------------------
 do_check() {
-    c_step "预检"
+    c_step "Prerequisite checks"
 
     if ! command -v nvidia-smi >/dev/null; then
-        c_err "找不到 nvidia-smi"; return 1
+        c_err "nvidia-smi not found"; return 1
     fi
     local gpu cc
     gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
     cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)"
     c_info "GPU: ${gpu} (compute capability ${cc})"
     if [[ "${cc}" != "12.0" ]]; then
-        c_warn "本脚本针对 sm_120 (5090/Blackwell)，当前是 ${cc}"
-        c_warn "如需在别的卡上用，请改 TORCH_CUDA_ARCH_LIST"
+        c_warn "This script targets sm_120 (5090/Blackwell); current capability is ${cc}"
+        c_warn "Change TORCH_CUDA_ARCH_LIST to use another GPU"
     fi
 
     if [[ ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
-        c_err "找不到 ${CUDA_HOME}/bin/nvcc —— Blackwell 需要 CUDA >= 12.8"; return 1
+        c_err "${CUDA_HOME}/bin/nvcc not found; Blackwell requires CUDA >= 12.8"; return 1
     fi
     c_info "nvcc: $(${CUDA_HOME}/bin/nvcc --version | grep -oE 'release [0-9.]+' | head -1)"
 
     if [[ ! -x "${CONDA_ROOT}/bin/conda" ]]; then
-        c_err "找不到 conda: ${CONDA_ROOT}/bin/conda"; return 1
+        c_err "conda not found: ${CONDA_ROOT}/bin/conda"; return 1
     fi
 
-    c_info "gcc: $(gcc -dumpversion)  (CUDA 12.8 支持 gcc <= 14)"
-    c_info "内存: $(free -g | awk '/^Mem:/{print $2}')GB, 核心: $(nproc), MAX_JOBS=${MAX_JOBS}"
-    c_ok "预检通过"
+    c_info "gcc: $(gcc -dumpversion)  (CUDA 12.8 supports gcc <= 14)"
+    c_info "Memory: $(free -g | awk '/^Mem:/{print $2}') GB, cores: $(nproc), MAX_JOBS=${MAX_JOBS}"
+    c_ok "Prerequisite checks passed"
 }
 
 #------------------------------------------------------------------------------
-# 2. 克隆仓库
+# 2. Clone repository
 #------------------------------------------------------------------------------
 do_repo() {
-    c_step "克隆 droid_metric"
+    c_step "Clone droid_metric"
     mkdir -p "${ROOT}"
     if [[ -d "${REPO}/.git" ]]; then
-        c_ok "已存在: ${REPO}"
+        c_ok "Already exists: ${REPO}"
         git -C "${REPO}" submodule update --init --recursive
     else
         git clone --recursive https://github.com/Jianxff/droid_metric.git "${REPO}"
     fi
-    [[ -f "${REPO}/modules/droid_slam/setup.py" ]] || { c_err "子模块 droid_slam 缺失"; return 1; }
-    [[ -d "${REPO}/modules/metric3d/mono"     ]] || { c_err "子模块 metric3d 缺失";   return 1; }
-    c_ok "仓库就绪"
+    [[ -f "${REPO}/modules/droid_slam/setup.py" ]] || { c_err "droid_slam submodule is missing"; return 1; }
+    [[ -d "${REPO}/modules/metric3d/mono"     ]] || { c_err "metric3d submodule is missing";   return 1; }
+    c_ok "Repository ready"
 }
 
 #------------------------------------------------------------------------------
-# 3. 补丁
+# 3. Patches
 #------------------------------------------------------------------------------
-#  补丁 A —— sm_120 (5090 必需)
-#    DROID-SLAM 的 setup.py 把 nvcc gencode 硬编码到 sm_86 为止。
-#    在 5090 上编出来的 .so 没有 sm_120 的 kernel image，运行时会报：
+#  Patch A - sm_120 (required for the RTX 5090)
+#    DROID-SLAM's setup.py hard-codes nvcc gencode only through sm_86.
+#    A .so built this way has no sm_120 kernel image and fails on a 5090:
 #       CUDA error: no kernel image is available for execution on the device
-#    把两处 gencode 列表（droid_backends / lietorch_backends）都换成 compute_120/sm_120。
+#    Replace both gencode lists (droid_backends / lietorch_backends) with compute_120/sm_120.
 #
-#  补丁 B —— 新版 torch 的 AT_DISPATCH (编译必需)
-#    这份 DROID-SLAM 是 2022 年的代码，用的是 AT_DISPATCH_xxx(tensor.type(), ...)。
-#    新版 torch 里 tensor.type() 返回 at::DeprecatedTypeProperties，而 AT_DISPATCH
-#    要求 c10::ScalarType，编译直接报：
+#  Patch B - AT_DISPATCH for newer torch versions (required to compile)
+#    This 2022 DROID-SLAM code uses AT_DISPATCH_xxx(tensor.type(), ...).
+#    In newer torch versions tensor.type() returns at::DeprecatedTypeProperties, while
+#    AT_DISPATCH requires c10::ScalarType, producing this compilation error:
 #       error: no suitable conversion function from "const at::DeprecatedTypeProperties"
 #              to "c10::ScalarType" exists
-#    改成 tensor.scalar_type()。共 3 处（correlation_kernels.cu ×2, altcorr_kernel.cu ×1）。
+#    Change it to tensor.scalar_type() at three sites (correlation_kernels.cu x2, altcorr_kernel.cu x1).
 #
-#  补丁 C —— lietorch 的自定义 dispatch 宏 (编译必需)
-#    lietorch 有自己的 DISPATCH_GROUP_AND_FLOATING_TYPES 宏，同样传 X.type()，
-#    而且宏体里调用 ::detail::scalar_type() —— 那是旧 ATen 放在全局 detail 命名空间
-#    的辅助函数，新版 torch 已经没有了。
-#    这里把宏体改成直接取 ScalarType，并把 38 处调用点（lietorch_gpu.cu 19 +
-#    lietorch_cpu.cpp 19）的 .type() 换成 .scalar_type()。
+#  Patch C - lietorch's custom dispatch macro (required to compile)
+#    lietorch's DISPATCH_GROUP_AND_FLOATING_TYPES macro also receives X.type().
+#    Its body calls ::detail::scalar_type(), an old ATen helper in the global detail
+#    namespace that newer torch versions removed.
+#    Make the macro use ScalarType directly and replace .type() with .scalar_type()
+#    at 38 call sites (19 in lietorch_gpu.cu and 19 in lietorch_cpu.cpp).
 #------------------------------------------------------------------------------
 do_patch() {
-    c_step "打补丁 (sm_120 + 新版 torch API)"
+    c_step "Apply patches (sm_120 + newer torch API)"
     local setup="${REPO}/modules/droid_slam/setup.py"
-    [[ -f "${setup}" ]] || { c_err "找不到 ${setup}"; return 1; }
+    [[ -f "${setup}" ]] || { c_err "${setup} not found"; return 1; }
 
     python3 - "${setup}" <<'PYEOF'
 import re, sys, pathlib
@@ -149,25 +149,25 @@ p = pathlib.Path(sys.argv[1])
 s = p.read_text()
 
 if 'compute_120' in s:
-    print('[=] setup.py 已打过补丁，跳过')
+    print('[=] setup.py is already patched; skipping')
     sys.exit(0)
 
 bak = p.with_name(p.name + '.orig')
 if not bak.exists():
     bak.write_text(s)
-    print(f'[+] 备份原文件 -> {bak.name}')
+    print(f'[+] Backed up original file -> {bak.name}')
 
-# 把连续的 gencode 行整体替换成 sm_120
+# Replace each contiguous gencode block with sm_120.
 new, n = re.subn(
     r"(?:[ \t]*'-gencode=arch=compute_\d+,code=sm_\d+',?[ \t]*\n)+",
     "                    '-gencode=arch=compute_120,code=sm_120',\n",
     s)
-assert n == 2, f'期望替换 2 处 gencode 块，实际 {n} 处'
+assert n == 2, f'Expected 2 gencode blocks, found {n}'
 p.write_text(new)
-print(f'[+] 已替换 {n} 处 gencode 块 -> compute_120/sm_120')
+print(f'[+] Replaced {n} gencode blocks -> compute_120/sm_120')
 PYEOF
 
-    # 补丁 B: AT_DISPATCH_xxx(t.type(), ...) -> AT_DISPATCH_xxx(t.scalar_type(), ...)
+    # Patch B: AT_DISPATCH_xxx(t.type(), ...) -> AT_DISPATCH_xxx(t.scalar_type(), ...)
     python3 - "${REPO}/modules/droid_slam/src" <<'PYEOF'
 import re, sys, pathlib
 src = pathlib.Path(sys.argv[1])
@@ -180,13 +180,13 @@ for f in sorted(list(src.glob('*.cu')) + list(src.glob('*.cpp'))):
         if not bak.exists():
             bak.write_text(s)
         f.write_text(new)
-        print(f'[+] {f.name}: {n} 处 .type() -> .scalar_type()')
+        print(f'[+] {f.name}: {n} occurrences of .type() -> .scalar_type()')
         total += n
 if total == 0:
-    print('[=] AT_DISPATCH 已是 scalar_type()，跳过')
+    print('[=] AT_DISPATCH already uses scalar_type(); skipping')
 PYEOF
 
-    # 补丁 C: lietorch 的 DISPATCH_GROUP_AND_FLOATING_TYPES 宏 + 38 处调用点
+    # Patch C: lietorch's DISPATCH_GROUP_AND_FLOATING_TYPES macro and 38 call sites.
     python3 - "${REPO}/modules/droid_slam/thirdparty/lietorch/lietorch" <<'PYEOF'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -197,19 +197,19 @@ def backup_write(f, old, new):
         bak.write_text(old)
     f.write_text(new)
 
-# 宏体：::detail::scalar_type() 在新版 torch 已不存在，直接用传进来的 ScalarType
+# Macro body: newer torch removed ::detail::scalar_type(); use the supplied ScalarType.
 h = root / 'include' / 'dispatch.h'
 s = h.read_text()
 if '::detail::scalar_type' in s:
     new = s.replace('at::ScalarType _st = ::detail::scalar_type(the_type);',
                     'at::ScalarType _st = the_type;')
-    assert new != s, 'dispatch.h 宏体替换失败'
+    assert new != s, 'Failed to replace the dispatch.h macro body'
     backup_write(h, s, new)
-    print('[+] dispatch.h: 宏体去掉 ::detail::scalar_type()')
+    print('[+] dispatch.h: removed ::detail::scalar_type() from macro body')
 else:
-    print('[=] dispatch.h 已打过补丁，跳过')
+    print('[=] dispatch.h is already patched; skipping')
 
-# 调用点：DISPATCH_GROUP_AND_FLOATING_TYPES(g, X.type(), ...) -> X.scalar_type()
+# Call sites: DISPATCH_GROUP_AND_FLOATING_TYPES(g, X.type(), ...) -> X.scalar_type()
 total = 0
 for f in sorted(root.glob('src/*.cu')) + sorted(root.glob('src/*.cpp')):
     s = f.read_text()
@@ -217,25 +217,25 @@ for f in sorted(root.glob('src/*.cu')) + sorted(root.glob('src/*.cpp')):
                      r'\1.scalar_type()', s)
     if n:
         backup_write(f, s, new)
-        print(f'[+] {f.name}: {n} 处 .type() -> .scalar_type()')
+        print(f'[+] {f.name}: {n} occurrences of .type() -> .scalar_type()')
         total += n
 if total == 0:
-    print('[=] lietorch 调用点已是 scalar_type()，跳过')
+    print('[=] lietorch call sites already use scalar_type(); skipping')
 PYEOF
 
-    # 补丁 D: Metric3D 的 comm.py 硬 import mmcv
+    # Patch D: Metric3D's comm.py unconditionally imports mmcv.
     python3 - "${REPO}/modules/metric3d/mono/utils/comm.py" <<'PYEOF'
 import sys, pathlib
 f = pathlib.Path(sys.argv[1])
 s = f.read_text()
-old = '\nfrom mmcv.utils import collect_env as collect_base_env\n'   # 行首无缩进
-# 注意：判据必须带行首换行。打完补丁后这句会缩进到 try 里，若用不带缩进的子串
-# 判断会一直匹配成功，导致重复打补丁、把 try 嵌套坏掉。
+old = '\nfrom mmcv.utils import collect_env as collect_base_env\n'   # No leading indentation.
+# The test must include the leading newline. After patching, this statement is
+# indented inside try; an unindented substring test would keep nesting try blocks.
 if 'mmengine.utils.dl_utils import collect_env' in s or old not in s:
-    print('[=] comm.py 已打过补丁，跳过')
+    print('[=] comm.py is already patched; skipping')
     sys.exit(0)
-# 唯一使用点（collect_env()）在源码里整段被注释掉了，是个死导入。
-# 同文件里 get_git_hash 已经有 try/except 回退 mmengine，作者漏了这一个，照着补齐。
+# Its only use in collect_env() is commented out, so this is a dead import.
+# get_git_hash already falls back to mmengine; apply the same pattern here.
 new = s.replace(old,
     '\ntry:\n'
     '    from mmcv.utils import collect_env as collect_base_env\n'
@@ -245,36 +245,36 @@ bak = f.with_name(f.name + '.orig')
 if not bak.exists():
     bak.write_text(s)
 f.write_text(new)
-print('[+] comm.py: mmcv 导入改为可选（回退 mmengine）')
+print('[+] comm.py: made mmcv optional with an mmengine fallback')
 PYEOF
 
-    # 补丁 E: depth.py 的上游 bug —— argparse 定义的是 --images (args.images)，
-    # 但调用时写成 args.rgb，导致 readme 里的分步用法直接 AttributeError。
-    # （reconstruct.py 是直接调 depth.main()，所以一步到位的用法不受影响。）
+    # Patch E: argparse defines --images (args.images), but the upstream call
+    # uses args.rgb, so the documented staged command raises AttributeError.
+    # reconstruct.py calls depth.main() directly and is unaffected.
     python3 - "${REPO}/depth.py" <<'PYEOF'
 import sys, pathlib
 f = pathlib.Path(sys.argv[1])
 s = f.read_text()
 if 'input_images=args.rgb' not in s:
-    print('[=] depth.py 已打过补丁，跳过')
+    print('[=] depth.py is already patched; skipping')
     sys.exit(0)
 bak = f.with_name(f.name + '.orig')
 if not bak.exists():
     bak.write_text(s)
 f.write_text(s.replace('input_images=args.rgb', 'input_images=args.images'))
-print('[+] depth.py: args.rgb -> args.images (上游 bug)')
+print('[+] depth.py: args.rgb -> args.images (upstream bug)')
 PYEOF
 
-    # 补丁 F: matplotlib 3.9 移除了 matplotlib.cm.get_cmap()。
-    # Metric3D 存深度彩色图时用到它（depth.py --out-colormap / reconstruct.py），
-    # 本机 matplotlib 3.11 会 AttributeError。换成 3.5+ 就有的 matplotlib.colormaps[]。
+    # Patch F: matplotlib 3.9 removed matplotlib.cm.get_cmap().
+    # Metric3D uses it to save colorized depth maps; matplotlib 3.11 raises
+    # AttributeError. Use matplotlib.colormaps[], available since 3.5.
     python3 - "${REPO}/modules/metric3d/mono/utils/transform.py" <<'PYEOF'
 import sys, pathlib
 f = pathlib.Path(sys.argv[1])
 s = f.read_text()
 old = 'cmap_m = matplotlib.cm.get_cmap(cmap)'
 if old not in s:
-    print('[=] transform.py 已打过补丁，跳过')
+    print('[=] transform.py is already patched; skipping')
     sys.exit(0)
 bak = f.with_name(f.name + '.orig')
 if not bak.exists():
@@ -283,101 +283,99 @@ f.write_text(s.replace(old, 'cmap_m = matplotlib.colormaps[cmap]'))
 print('[+] transform.py: matplotlib.cm.get_cmap -> matplotlib.colormaps[]')
 PYEOF
 
-    c_ok "补丁完成"
+    c_ok "Patches applied"
 }
 
 #------------------------------------------------------------------------------
-# 4. conda 环境 + Python 依赖
+# 4. Conda environment and Python dependencies
 #------------------------------------------------------------------------------
-#  依赖相对上游 requirements.txt 的改动，全部是为了 5090：
-#    torch 2.0.1  -> 2.8.0+cu128    上游版本没有 sm_120 kernel
-#    torchvision  -> 0.23.0+cu128   跟 torch 配套
-#    numpy 1.26.1 -> 1.26.4         保持 <2（DROID-SLAM 老代码对 numpy 2 不友好）
-#    torch-scatter -> 源码编译       data.pyg.org 的 pt28cu128 预编译轮子链接的是
-#                                   GLIBC 2.32，本机 Ubuntu 20.04 只有 2.31，装上
-#                                   能装、一 import 就 OSError。必须本地编。
-#    xformers 0.0.21 -> 不装        它死锁 torch 2.0.1；Metric3D 里三处 import 都在
-#                                   try/except ImportError 内，XFORMERS_AVAILABLE=False
-#                                   时自动回退标准 attention
-#    mmcv         -> 不装           只在 ViT_DINO_reg.py 的 __main__ 分支里用到，
-#                                   实际推理路径只需要 mmengine（纯 Python）
+#  Changes from upstream requirements.txt, all needed for the RTX 5090:
+#    torch 2.0.1  -> 2.8.0+cu128    The upstream version has no sm_120 kernel.
+#    torchvision  -> 0.23.0+cu128   Matches torch.
+#    numpy 1.26.1 -> 1.26.4         Stay below 2; old DROID-SLAM dislikes NumPy 2.
+#    torch-scatter -> source build   The pt28cu128 wheel links against GLIBC 2.32,
+#                                   but this Ubuntu 20.04 host has 2.31. It installs
+#                                   but raises OSError on import, so build locally.
+#    xformers 0.0.21 -> omitted      It pins torch 2.0.1. Metric3D's imports are
+#                                   guarded and fall back to standard attention.
+#    mmcv         -> omitted         Only used in ViT_DINO_reg.py's __main__ branch;
+#                                   inference only needs pure-Python mmengine.
 #------------------------------------------------------------------------------
 do_env() {
-    c_step "创建 conda 环境 ${ENV_DROID}"
+    c_step "Create conda environment ${ENV_DROID}"
 
     if [[ -x "${PY}" ]]; then
-        c_ok "环境已存在: ${CONDA_ROOT}/envs/${ENV_DROID}"
+        c_ok "Environment already exists: ${CONDA_ROOT}/envs/${ENV_DROID}"
     else
         "${CONDA_ROOT}/bin/conda" create -y -n "${ENV_DROID}" "python=${PY_VER}"
     fi
     c_info "python: $(${PY} --version 2>&1)"
 
-    c_info "装 torch ${TORCH_VER}+${CU_TAG} / torchvision ${TV_VER}+${CU_TAG}"
+    c_info "Install torch ${TORCH_VER}+${CU_TAG} / torchvision ${TV_VER}+${CU_TAG}"
     "${PY}" -m pip install -q --upgrade pip
     "${PY}" -m pip install "torch==${TORCH_VER}" "torchvision==${TV_VER}" \
         --index-url "https://download.pytorch.org/whl/${CU_TAG}"
 
-    # gdown>=6 删掉了 download(fuzzy=...) 参数，而 download_models.py 用了它，
-    # 装 6.x 的话下载权重会直接 TypeError。
-    c_info "装 droid_metric / Metric3D 其余依赖"
+    # gdown>=6 removed download(fuzzy=...), which download_models.py uses.
+    # Version 6.x would make weight downloads fail with TypeError.
+    c_info "Install remaining droid_metric / Metric3D dependencies"
     "${PY}" -m pip install \
         "numpy==1.26.4" opencv-python "gdown<6" py3_wget tqdm psutil \
         open3d tensorboard scipy matplotlib pyyaml evo \
         mmengine timm html4vision plyfile Pillow
 
-    # setuptools >= 80 移除了 `setup.py install`，而 droid_slam 的 setup.py 里
-    # 有两个 setup() 调用（droid_backends + lietorch）。pip install . 只会执行
-    # 第一个，lietorch 会漏装，所以必须保留 setup.py install 的能力。
-    c_info "钉 setuptools<80（droid_slam 需要 setup.py install 跑两个 setup()）"
+    # setuptools >= 80 removed `setup.py install`, while droid_slam's setup.py has
+    # two setup() calls. `pip install .` only runs the first and omits lietorch.
+    c_info "Pin setuptools<80 (droid_slam needs setup.py install for two setup() calls)"
     "${PY}" -m pip install -q "setuptools<80" wheel ninja
 
-    # data.pyg.org 的预编译轮子链接 GLIBC 2.32，本机 Ubuntu 20.04 是 2.31，
-    # 装得上但 import 就 OSError，所以本地编。
+    # The data.pyg.org wheel links against GLIBC 2.32, while this host has 2.31.
+    # It installs but raises OSError on import, so build it locally.
     if "${PY}" -c 'import torch_scatter' 2>/dev/null; then
-        c_ok "torch_scatter 已可用"
+        c_ok "torch_scatter is available"
     else
-        c_info "从源码编译 torch_scatter (sm_120)"
+        c_info "Build torch_scatter from source (sm_120)"
         "${PY}" -m pip uninstall -y torch_scatter >/dev/null 2>&1 || true
         FORCE_CUDA=1 "${PY}" -m pip install --no-build-isolation \
             --no-binary=torch_scatter torch_scatter
     fi
 
-    c_ok "Python 依赖装完"
+    c_ok "Python dependencies installed"
 }
 
 #------------------------------------------------------------------------------
-# 5. 编译 CUDA 扩展
+# 5. Build CUDA extensions
 #------------------------------------------------------------------------------
 do_build() {
-    c_step "编译 droid_backends / lietorch (sm_120)"
-    [[ -x "${PY}" ]] || { c_err "环境 ${ENV_DROID} 不存在，先跑 'env'"; return 1; }
+    c_step "Build droid_backends / lietorch (sm_120)"
+    [[ -x "${PY}" ]] || { c_err "Environment ${ENV_DROID} does not exist; run 'env' first"; return 1; }
 
     grep -q 'compute_120' "${REPO}/modules/droid_slam/setup.py" \
-        || { c_err "setup.py 没打补丁，先跑 'patch'"; return 1; }
+        || { c_err "setup.py is not patched; run 'patch' first"; return 1; }
 
     c_info "CUDA_HOME=${CUDA_HOME}  ARCH=${TORCH_CUDA_ARCH_LIST}  MAX_JOBS=${MAX_JOBS}"
     ( cd "${REPO}/modules/droid_slam" && "${PY}" setup.py install )
 
-    c_ok "CUDA 扩展编译完成"
+    c_ok "CUDA extensions built"
 }
 
 #------------------------------------------------------------------------------
-# 6. 预训练权重
+# 6. Pretrained weights
 #------------------------------------------------------------------------------
 do_models() {
-    c_step "下载预训练权重 (~7GB -> ${REPO}/weights)"
-    [[ -x "${PY}" ]] || { c_err "环境 ${ENV_DROID} 不存在，先跑 'env'"; return 1; }
+    c_step "Download pretrained weights (~7 GB -> ${REPO}/weights)"
+    [[ -x "${PY}" ]] || { c_err "Environment ${ENV_DROID} does not exist; run 'env' first"; return 1; }
     ( cd "${REPO}" && "${PY}" download_models.py )
     c_info "weights/:"; ls -lh "${REPO}/weights" 2>/dev/null || true
-    c_ok "权重就绪"
+    c_ok "Weights ready"
 }
 
 #------------------------------------------------------------------------------
-# 7. 验证
+# 7. Validation
 #------------------------------------------------------------------------------
 do_verify() {
-    c_step "验证 ${ENV_DROID} (droid_metric)"
-    [[ -x "${PY}" ]] || { c_err "环境 ${ENV_DROID} 不存在"; return 1; }
+    c_step "Validate ${ENV_DROID} (droid_metric)"
+    [[ -x "${PY}" ]] || { c_err "Environment ${ENV_DROID} does not exist"; return 1; }
 
     ( cd "${REPO}" && "${PY}" - <<'PYEOF'
 import sys, torch
@@ -392,16 +390,16 @@ def chk(name, fn):
 d = torch.device('cuda')
 print(f'  torch {torch.__version__} | cuda {torch.version.cuda}')
 print(f'  arch_list: {torch.cuda.get_arch_list()}')
-assert 'sm_120' in torch.cuda.get_arch_list(), 'torch 里没有 sm_120 kernel！'
+assert 'sm_120' in torch.cuda.get_arch_list(), 'torch has no sm_120 kernel!'
 print(f'  device: {torch.cuda.get_device_name(0)} {torch.cuda.get_device_capability(0)}')
 
 def _matmul():
-    a = torch.randn(2048, 2048, device=d); (a @ a).sum().item(); return 'sm_120 矩阵乘 OK'
+    a = torch.randn(2048, 2048, device=d); (a @ a).sum().item(); return 'sm_120 matrix multiplication OK'
 chk('torch CUDA', _matmul)
 
 def _lietorch():
     from lietorch import SO3
-    p = SO3.Random(4, device=d)          # 触发 lietorch_backends 的 CUDA kernel
+    p = SO3.Random(4, device=d)          # Trigger a lietorch_backends CUDA kernel.
     return f'SO3.Random -> {tuple(p.shape)}'
 chk('lietorch (CUDA)', _lietorch)
 
@@ -421,27 +419,27 @@ chk('mmengine', lambda: __import__('mmengine').__version__)
 
 def _metric3d():
     from modules.metric3d.mono.model.monodepth_model import get_configured_monodepth_model
-    return 'Metric3D 模型代码可导入 (xformers 缺失时自动回退)'
+    return 'Metric3D model code imports successfully (automatic fallback without xformers)'
 chk('Metric3D', _metric3d)
 
 sys.exit(0 if ok else 1)
 PYEOF
-    ) || { c_err "${ENV_DROID} 验证未全部通过"; return 1; }
-    c_ok "${ENV_DROID} 验证通过"
+    ) || { c_err "${ENV_DROID} did not pass every validation"; return 1; }
+    c_ok "${ENV_DROID} validation passed"
 
-    c_step "验证 ${ENV_NERF} (nerfstudio，只读校验)"
+    c_step "Validate ${ENV_NERF} (nerfstudio, read-only)"
     local pyn="${CONDA_ROOT}/envs/${ENV_NERF}/bin/python"
     if [[ ! -x "${pyn}" ]]; then
-        c_warn "环境 ${ENV_NERF} 不存在，跳过"
+        c_warn "Environment ${ENV_NERF} does not exist; skipping"
         return 0
     fi
     "${pyn}" - <<'PYEOF'
 import torch
 from importlib.metadata import version as _v
-print(f'  torch {torch.__version__} | arch_list 含 sm_120: {"sm_120" in torch.cuda.get_arch_list()}')
+print(f'  torch {torch.__version__} | arch_list includes sm_120: {"sm_120" in torch.cuda.get_arch_list()}')
 
 def _tcnn():
-    # 实际跑一次 HashGrid + FullyFusedMLP，确认 sm_120 kernel 可用
+    # Run HashGrid + FullyFusedMLP once to verify that the sm_120 kernel works.
     import tinycudann as tcnn
     d = torch.device('cuda')
     enc = tcnn.Encoding(3, {"otype": "HashGrid", "n_levels": 16, "n_features_per_level": 2,
@@ -454,7 +452,7 @@ def _tcnn():
     return f'{_v("tinycudann")} | HashGrid+FullyFusedMLP -> {tuple(y.shape)}'
 
 def _gsplat():
-    # 首次调用会 JIT 编译 CUDA（约 6 分钟），之后走缓存
+    # The first call JIT-compiles CUDA (about six minutes); later calls use the cache.
     from gsplat import rasterization
     d = torch.device('cuda'); N = 256
     img, _, _ = rasterization(
@@ -474,11 +472,11 @@ for name, fn in [
     try:    print(f'  [\033[1;32m✓\033[0m] {name}: {fn()}')
     except Exception as e: print(f'  [\033[1;31m✗\033[0m] {name}: {type(e).__name__}: {str(e)[:120]}')
 PYEOF
-    c_ok "${ENV_NERF} 校验完成（未做任何修改）"
+    c_ok "${ENV_NERF} validation complete (no changes made)"
 }
 
 #------------------------------------------------------------------------------
-# 主流程
+# Main workflow
 #------------------------------------------------------------------------------
 main() {
     local target="${1:-all}"
@@ -498,21 +496,21 @@ main() {
             do_build
             do_models
             do_verify
-            c_step "全部完成"
+            c_step "All stages complete"
             cat <<EOF
 
-  代码/权重/输出   ${ROOT}
+  Code/weights/output ${ROOT}
   droid_metric     ${REPO}
-  conda 环境       ${CONDA_ROOT}/envs/${ENV_DROID}   (droid_metric)
-                   ${CONDA_ROOT}/envs/${ENV_NERF}    (nerfstudio，未改动)
+  Conda environments  ${CONDA_ROOT}/envs/${ENV_DROID}   (droid_metric)
+                      ${CONDA_ROOT}/envs/${ENV_NERF}    (nerfstudio, unchanged)
 
-  用法：
-    source ${ROOT}/env_droid.sh        # 进 droid_metric 环境
-    source ${ROOT}/env_nerfstudio.sh   # 进 nerfstudio 环境
+  Usage:
+    source ${ROOT}/env_droid.sh        # Enter the droid_metric environment
+    source ${ROOT}/env_nerfstudio.sh   # Enter the nerfstudio environment
 
 EOF
             ;;
-        *) c_err "未知参数: ${target}"
+        *) c_err "Unknown argument: ${target}"
            grep -E '^#    bash install_nevstereo\.sh' "$0" | sed 's/^#/ /'
            exit 1 ;;
     esac
