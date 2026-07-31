@@ -1,0 +1,52 @@
+# Third-party source excluded from this publication
+/third_party/
+
+# Datasets, generated results, and local experiments
+/data/
+/testdata/
+**/outputs/
+**/output/
+**/runs/
+**/logs/
+
+# Model weights and checkpoints
+/droid_metric/weights/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Generated binary and media artifacts
+*.npy
+*.npz
+*.ply
+*.bin
+*.db
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+
+# Python, native builds, and patch backups
+**/__pycache__/
+*.py[cod]
+*.so
+**/build/
+**/dist/
+*.egg-info/
+*.orig
+
+# Local tooling and editor state
+/HANDOFF.md
+/.claude/
+/.cursor/
+.vscode/
+.idea/
+
+# Environment and operating-system files
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

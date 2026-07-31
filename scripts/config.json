@@ -1,0 +1,69 @@
+{
+  "_comment": "All configuration lives here. Unset keys fall back to the defaults in lib/load_config.py, so you only need to write what you want to change. Paths may be absolute or relative to this file's directory.",
+
+  "project": {
+    "root": "/path/to/your/scene",
+    "work_dir": null
+  },
+
+  "_comment_camera_model": "camera_model is the model used during SfM. PINHOLE asserts the lens has no distortion (images already undistorted, or rendered). For real cameras -- especially wide-angle/fisheye -- use OPENCV so COLMAP estimates the distortion and image_undistorter removes it. Note the model handed to nerfstudio is always PINHOLE; this setting only affects SfM accuracy.",
+  "_comment_undistort": "Set undistort=false to skip image_undistorter. With PINHOLE input it is numerically a no-op that merely copies the images, so skipping saves that disk space.",
+
+  "colmap": {
+    "enabled": true,
+    "image_dir": "images",
+    "matcher": "exhaustive",
+    "camera_model": "PINHOLE",
+    "undistort": true,
+    "single_camera": 1
+  },
+
+  "nerfstudio": {
+    "method": "nerfacto",
+    "max_num_iterations": 30000,
+    "config_path": null,
+    "extra_args": []
+  },
+
+  "_comment_direction": "With auto_direction=true the stereo shift direction is chosen from the camera trajectory. A NeRF is only well trained near viewpoints the camera actually visited: shifting along the trajectory stays on the observed manifold, whereas shifting perpendicular to it extrapolates and renders blurry. When the trajectory has no dominant direction (orbits, free handheld motion) it falls back to the `direction` field below.",
+  "_comment_shift": "With shift_mode=pixels, shift_pixels sets the target disparity as a fraction of image width (0.1 = 64 px on a 640-wide image). Disparity varies with depth, so it must be anchored to a reference depth -- by default the 25th percentile of the COLMAP sparse-point depths (anchoring near keeps near-plane disparity bounded, staying inside the matcher's usable range). No rendering needed. Set reference_depth (metres) to pin it. shift_mode=baseline restores the old behaviour: give the normalised baseline directly.",
+
+  "stereo": {
+    "shift_mode": "pixels",
+    "shift_pixels": 0.1,
+    "reference_depth": null,
+    "reference_depth_percentile": 25,
+    "auto_direction": true,
+    "auto_direction_min_dominance": 0.6,
+    "direction": "up",
+    "valid_iters": 32
+  },
+
+  "filter": {
+    "enabled": true,
+    "num_src": 8,
+    "max_reproj_error": 2.0,
+    "max_depth_error": 0.01,
+    "min_triangulation_angle": 3.0,
+    "min_num_consistent": 2,
+    "use_ncc": true,
+    "ncc_window": 4,
+    "min_ncc": 0.3,
+    "min_texture_std": 0.02
+  },
+
+  "_comment_slam": "Feed the filtered depth to DROID-SLAM as trusted depth and solve for the camera trajectory in RGBD mode. Pixels zeroed by the filter are exactly what DROID treats as 'no depth prior', so the semantics line up for free. evaluate=true measures ATE against the known poses in transforms.json -- which in effect measures depth quality.",
+
+  "slam": {
+    "enabled": false,
+    "use_filtered_depth": true,
+    "global_ba_frontend": 0,
+    "evaluate": true
+  },
+
+  "output": {
+    "depth_png": true,
+    "clean_intermediate": false,
+    "visualize": false
+  }
+}
